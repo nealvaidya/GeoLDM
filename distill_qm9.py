@@ -6,6 +6,7 @@ import time
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 import wandb
 from configs.datasets_config import get_dataset_info
@@ -14,7 +15,7 @@ from equivariant_diffusion.utils import (
     remove_mean_with_mask,
     sample_center_gravity_zero_gaussian_with_mask,
 )
-from qm9 import dataset
+from qm9 import dataset, losses
 from qm9.models import get_latent_consistency, get_latent_diffusion, get_optim
 from train_test import check_mask_correct
 import utils
@@ -54,7 +55,6 @@ def parse_args():
         "--include_charges", type=eval, default=True, help="include atom charge or not"
     )
 
-
     # Training Args
     training_args = parser.add_argument_group("Training Args")
     training_args.add_argument("--output_dir", type=str, default="geolcm_distilled")
@@ -79,6 +79,7 @@ def parse_args():
     logging_args = parser.add_argument_group("Logging Args")
     logging_args.add_argument("--no_wandb", action="store_true")
     logging_args.add_argument("--run_name", type=str, default="debug")
+    logging_args.add_argument("--n_report_steps", type=int, default=1)
 
     args = parser.parse_args()
     return args
@@ -115,9 +116,21 @@ def preprocess_data(args, data, device, dtype):
 
 
 def train_epoch(
-    args, loader, epoch, model, model_ema, ema, optim, gradnorm_queue, device, dtype
+    args,
+    loader,
+    nodes_dist,
+    epoch,
+    model,
+    teacher_model,
+    ema_decay,
+    optim,
+    gradnorm_queue,
+    device,
+    dtype,
 ):
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
     model.train()
+    n_iterations = len(loader)
     for i, data in enumerate(loader):
         x, h, node_mask, edge_mask = preprocess_data(args, data, device, dtype)
 
@@ -126,20 +139,22 @@ def train_epoch(
 
         optim.zero_grad()
 
-        loss = model(x, h, node_mask, edge_mask, context)
+        args.probabilistic_model = 'consistency'
+        nll, reg_term, mean_abs_z = losses.compute_loss_and_nll(
+            args, model, ema_model, teacher_model, nodes_dist, x, h, node_mask, edge_mask, context
+        )
+        loss = nll
         loss.backward()
-
-        if args.clip_grad:
-            grad_norm = utils.gradient_clipping(model, gradnorm_queue)
-        else:
-            grad_norm = 0.0
 
         optim.step()
 
         # Update EMA
-        if args.ema_decay > 0:
-            ema.update_model_average(model_ema, model)
+        ema_model.update_parameters(model)
 
+        if i % args.n_report_steps == 0:
+            print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
+                  f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
+                  f"RegTerm: {reg_term.item():.1f}, ")
 
 def main(args):
     # Set up DDP -------------
@@ -192,6 +207,7 @@ def main(args):
             f"{args.teacher_model}/generative_model_ema.npy", map_location=map_location
         )
     )
+    teacher_model = DDP(teacher_model, device_ids=[rank])
 
     ## Load Student Model
     student_model, nodes_dist, prop_dist = get_latent_consistency(
@@ -202,7 +218,8 @@ def main(args):
             f"{args.teacher_model}/generative_model_ema.npy", map_location=map_location
         )
     )
-    student_model = DDP(student_model, device_ids=[rank])
+    # student_model.load_teacher_model(teacher_model)
+    student_model = DDP(student_model, device_ids=[rank], find_unused_parameters=False)
 
     # Create Optimizer -----------
     optim = get_optim(args, student_model)
@@ -215,14 +232,15 @@ def main(args):
         train_epoch(
             args=args,
             loader=dataloaders["train"],
+            nodes_dist=nodes_dist,
             epoch=epoch,
             model=student_model,
-            model_ema=None,
-            ema=None,
+            teacher_model=teacher_model,
+            ema_decay=0.95,
             optim=optim,
             gradnorm_queue=gradnorm_queue,
             device=device_id,
-            dtype=dtype
+            dtype=dtype,
         )
         print(f"Epoch {epoch} took {time.time() - start_epoch:.1f} seconds.")
 

@@ -9,7 +9,7 @@ def assert_correctly_masked(variable, node_mask):
     assert (variable * (1 - node_mask)).abs().sum().item() < 1e-8
 
 
-def compute_loss_and_nll(args, generative_model, nodes_dist, x, h, node_mask, edge_mask, context):
+def compute_loss_and_nll(args, generative_model, ema_model, teacher_model, nodes_dist, x, h, node_mask, edge_mask, context):
     bs, n_nodes, n_dims = x.size()
 
 
@@ -34,6 +34,29 @@ def compute_loss_and_nll(args, generative_model, nodes_dist, x, h, node_mask, ed
 
         reg_term = torch.tensor([0.]).to(nll.device)
         mean_abs_z = 0.
+
+    elif args.probabilistic_model == 'consistency':
+        edge_mask = edge_mask.view(bs, n_nodes * n_nodes)
+
+        assert_correctly_masked(x, node_mask)
+
+        # Here x is a position tensor, and h is a dictionary with keys
+        # 'categorical' and 'integer'.
+        nll = generative_model(x, h, node_mask, edge_mask, ema_model, teacher_model, context)
+
+        N = node_mask.squeeze(2).sum(1).long()
+
+        log_pN = nodes_dist.log_prob(N)
+
+        assert nll.size() == log_pN.size()
+        nll = nll - log_pN
+
+        # Average over batch.
+        nll = nll.mean(0)
+
+        reg_term = torch.tensor([0.]).to(nll.device)
+        mean_abs_z = 0.
+
     else:
         raise ValueError(args.probabilistic_model)
 

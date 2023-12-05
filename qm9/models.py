@@ -159,7 +159,7 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train, map_locat
             loss_type=args.diffusion_loss_type,
             norm_values=args.normalize_factors,
             include_charges=args.include_charges
-            )
+            ).to(device)
 
         return vdm, nodes_dist, prop_dist
 
