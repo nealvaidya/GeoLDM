@@ -4,6 +4,7 @@ from qm9.data.collate import PreprocessQM9
 from qm9.data.utils import initialize_datasets
 import os
 
+from torch.utils.data.distributed import DistributedSampler
 
 def retrieve_dataloaders(cfg):
     if 'qm9' in cfg.dataset:
@@ -27,12 +28,28 @@ def retrieve_dataloaders(cfg):
             print("Retrieving molecules with only %d atoms" % filter_n_atoms)
             datasets = filter_atoms(datasets, filter_n_atoms)
 
+        if cfg.ddp:
+            samplers = {
+                "train": DistributedSampler(datasets['train']),
+                "valid": DistributedSampler(datasets['valid'], shuffle=False, drop_last=True),
+                "test": DistributedSampler(datasets['test'], shuffle=False, drop_last=True)
+            }
+        else:
+            samplers = {
+                "train": None,
+                "valid": None,
+                "test": None
+            }
+
         # Construct PyTorch dataloaders from datasets
         preprocess = PreprocessQM9(load_charges=cfg.include_charges)
+
+        # dropped the shuffle option in favor of sampler. might not work without ddp
         dataloaders = {split: DataLoader(dataset,
                                          batch_size=batch_size,
-                                         shuffle=args.shuffle if (split == 'train') else False,
                                          num_workers=num_workers,
+                                         pin_memory=cfg.pin_memory,
+                                         sampler=samplers[split],
                                          collate_fn=preprocess.collate_fn)
                              for split, dataset in datasets.items()}
     elif 'geom' in cfg.dataset:

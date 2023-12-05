@@ -3,6 +3,7 @@ from torch.distributions.categorical import Categorical
 
 import numpy as np
 from egnn.models import EGNN_dynamics_QM9, EGNN_encoder_QM9, EGNN_decoder_QM9
+from equivariant_diffusion.en_consistency import EnLatentConsistency
 
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion, EnHierarchicalVAE, EnLatentDiffusion
 
@@ -65,7 +66,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
     # else:
     print('Autoencoder models are _not_ conditioned on time.')
         # dynamics_in_node_nf = in_node_nf
-    
+
     encoder = EGNN_encoder_QM9(
         in_node_nf=in_node_nf, context_node_nf=args.context_node_nf, out_node_nf=args.latent_nf,
         n_dims=3, device=device, hidden_nf=args.nf,
@@ -75,7 +76,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
         include_charges=args.include_charges
         )
-    
+
     decoder = EGNN_decoder_QM9(
         in_node_nf=args.latent_nf, context_node_nf=args.context_node_nf, out_node_nf=in_node_nf,
         n_dims=3, device=device, hidden_nf=args.nf,
@@ -100,7 +101,7 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
     return vae, nodes_dist, prop_dist
 
 
-def get_latent_diffusion(args, device, dataset_info, dataloader_train):
+def get_latent_diffusion(args, device, dataset_info, dataloader_train, map_location):
 
     # Create (and load) the first stage model (Autoencoder).
     if args.ae_path is not None:
@@ -108,14 +109,14 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
             first_stage_args = pickle.load(f)
     else:
         first_stage_args = args
-    
+
     # CAREFUL with this -->
     if not hasattr(first_stage_args, 'normalization_factor'):
         first_stage_args.normalization_factor = 1
     if not hasattr(first_stage_args, 'aggregation_method'):
         first_stage_args.aggregation_method = 'sum'
 
-    device = torch.device("cuda" if first_stage_args.cuda else "cpu")
+    # device = torch.device("cuda" if first_stage_args.cuda else "cpu")
 
     first_stage_model, nodes_dist, prop_dist = get_autoencoder(
         first_stage_args, device, dataset_info, dataloader_train)
@@ -124,7 +125,7 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
     if args.ae_path is not None:
         fn = 'generative_model_ema.npy' if first_stage_args.ema_decay > 0 else 'generative_model.npy'
         flow_state_dict = torch.load(join(args.ae_path, fn),
-                                        map_location=device)
+                                        map_location=map_location)
         first_stage_model.load_state_dict(flow_state_dict)
 
     # Create the second stage model (Latent Diffusions).
@@ -165,6 +166,65 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
     else:
         raise ValueError(args.probabilistic_model)
 
+
+def get_latent_consistency(args, device, dataset_info, dataloader_train, map_location):
+
+    # Create (and load) the first stage model (Autoencoder). --------------
+    if args.ae_path is not None:
+        with open(join(args.ae_path, 'args.pickle'), 'rb') as f:
+            first_stage_args = pickle.load(f)
+    else:
+        first_stage_args = args
+
+    # CAREFUL with this -->
+    if not hasattr(first_stage_args, 'normalization_factor'):
+        first_stage_args.normalization_factor = 1
+    if not hasattr(first_stage_args, 'aggregation_method'):
+        first_stage_args.aggregation_method = 'sum'
+
+    first_stage_model, nodes_dist, prop_dist = get_autoencoder(
+        first_stage_args, device, dataset_info, dataloader_train)
+    first_stage_model.to(device)
+
+    if args.ae_path is not None:
+        fn = 'generative_model_ema.npy' if first_stage_args.ema_decay > 0 else 'generative_model.npy'
+        flow_state_dict = torch.load(join(args.ae_path, fn),
+                                        map_location=map_location)
+        first_stage_model.load_state_dict(flow_state_dict)
+
+    # Create the second stage model (Latent Consistency). -----------
+    args.latent_nf = first_stage_args.latent_nf
+    in_node_nf = args.latent_nf
+
+    if args.condition_time:
+        dynamics_in_node_nf = in_node_nf + 1
+    else:
+        print('Warning: dynamics model is _not_ conditioned on time.')
+        dynamics_in_node_nf = in_node_nf
+
+    net_dynamics = EGNN_dynamics_QM9(
+        in_node_nf=dynamics_in_node_nf, context_node_nf=args.context_node_nf,
+        n_dims=3, device=device, hidden_nf=args.nf,
+        act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
+        attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
+        inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
+        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method)
+
+    vcm = EnLatentConsistency(
+        vae=first_stage_model,
+        trainable_ae=args.trainable_ae,
+        dynamics=net_dynamics,
+        in_node_nf=in_node_nf,
+        n_dims=3,
+        timesteps=args.diffusion_steps,
+        noise_schedule=args.diffusion_noise_schedule,
+        noise_precision=args.diffusion_noise_precision,
+        loss_type=args.diffusion_loss_type,
+        norm_values=args.normalize_factors,
+        include_charges=args.include_charges
+        ).to(device)
+
+    return vcm, nodes_dist, prop_dist
 
 def get_optim(args, generative_model):
     optim = torch.optim.AdamW(

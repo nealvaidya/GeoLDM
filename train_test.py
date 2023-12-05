@@ -83,15 +83,15 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
                                             prop_dist, epoch=epoch)
             print(f'Sampling took {time.time() - start:.2f} seconds')
 
-            vis.visualize(f"outputs/{args.exp_name}/epoch_{epoch}_{i}", dataset_info=dataset_info, wandb=wandb)
-            vis.visualize_chain(f"outputs/{args.exp_name}/epoch_{epoch}_{i}/chain/", dataset_info, wandb=wandb)
+            vis.visualize(f"outputs/{args.exp_name}/epoch_{epoch}_{i}", dataset_info=dataset_info, wandb=wandb, epoch=epoch)
+            vis.visualize_chain(f"outputs/{args.exp_name}/epoch_{epoch}_{i}/chain/", dataset_info, wandb=wandb, epoch=epoch)
             if len(args.conditioning) > 0:
                 vis.visualize_chain("outputs/%s/epoch_%d/conditional/" % (args.exp_name, epoch), dataset_info,
-                                    wandb=wandb, mode='conditional')
+                                    wandb=wandb, mode='conditional', epoch=epoch)
         wandb.log({"Batch NLL": nll.item()}, commit=True)
         if args.break_train_epoch:
             break
-    wandb.log({"Train Epoch NLL": np.mean(nll_epoch)}, commit=False)
+    wandb.log({"Train Epoch NLL": np.mean(nll_epoch)}, commit=False, step=epoch)
 
 
 def check_mask_correct(variables, node_mask):

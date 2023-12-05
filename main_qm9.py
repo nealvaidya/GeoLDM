@@ -19,12 +19,17 @@ import time
 import pickle
 from qm9.utils import prepare_context, compute_mean_mad
 from train_test import train_epoch, test, analyze_and_save
+import os
+# import torch.distributed as dist
+
+
+# from torch.nn.parallel import DistributedDataParallel as DDP
 
 parser = argparse.ArgumentParser(description='E3Diffusion')
 parser.add_argument('--exp_name', type=str, default='debug_10')
 
 # Latent Diffusion args
-parser.add_argument('--train_diffusion', action='store_true', 
+parser.add_argument('--train_diffusion', action='store_true',
                     help='Train second stage LatentDiffusionModel model')
 parser.add_argument('--ae_path', type=str, default=None,
                     help='Specify first stage model path')
@@ -143,6 +148,9 @@ args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 device = torch.device("cuda" if args.cuda else "cpu")
 dtype = torch.float32
+torch.backends.cuda.matmul.allow_tf32 = True
+
+wandb_resume = False
 
 if args.resume is not None:
     exp_name = args.exp_name + '_resume'
@@ -151,6 +159,7 @@ if args.resume is not None:
     wandb_usr = args.wandb_usr
     normalization_factor = args.normalization_factor
     aggregation_method = args.aggregation_method
+    wandb_resume = True
 
     with open(join(args.resume, 'args.pickle'), 'rb') as f:
         args = pickle.load(f)
@@ -180,7 +189,7 @@ if args.no_wandb:
 else:
     mode = 'online' if args.online else 'offline'
 kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': 'e3_diffusion_qm9', 'config': args,
-          'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode}
+          'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode, 'resume': wandb_resume}
 wandb.init(**kwargs)
 wandb.save('*.txt')
 
@@ -224,9 +233,15 @@ def check_mask_correct(variables, node_mask):
 
 
 def main():
+    # dist.init_process_group("nccl")
+    # rank = dist.get_rank()
+
+    start_epoch = args.start_epoch
+
     if args.resume is not None:
-        flow_state_dict = torch.load(join(args.resume, 'flow.npy'))
+        flow_state_dict = torch.load(join(args.resume, 'generative_model_ema.npy'))
         optim_state_dict = torch.load(join(args.resume, 'optim.npy'))
+        start_epoch = torch.load(join(args.resume, 'epoch.npy'))
         model.load_state_dict(flow_state_dict)
         optim.load_state_dict(optim_state_dict)
 
@@ -277,17 +292,19 @@ def main():
                             partition='Test', device=device, dtype=dtype,
                             nodes_dist=nodes_dist, property_norms=property_norms)
 
+            if args.save_model:
+                args.current_epoch = epoch + 1
+                utils.save_model(optim, 'outputs/%s/optim.npy' % args.exp_name)
+                utils.save_model(model, 'outputs/%s/generative_model.npy' % args.exp_name)
+                torch.save(epoch, 'outputs/%s/epoch.npy' % args.exp_name)
+                if args.ema_decay > 0:
+                    utils.save_model(model_ema, 'outputs/%s/generative_model_ema.npy' % args.exp_name)
+                with open('outputs/%s/args.pickle' % args.exp_name, 'wb') as f:
+                    pickle.dump(args, f)
+
             if nll_val < best_nll_val:
                 best_nll_val = nll_val
                 best_nll_test = nll_test
-                if args.save_model:
-                    args.current_epoch = epoch + 1
-                    utils.save_model(optim, 'outputs/%s/optim.npy' % args.exp_name)
-                    utils.save_model(model, 'outputs/%s/generative_model.npy' % args.exp_name)
-                    if args.ema_decay > 0:
-                        utils.save_model(model_ema, 'outputs/%s/generative_model_ema.npy' % args.exp_name)
-                    with open('outputs/%s/args.pickle' % args.exp_name, 'wb') as f:
-                        pickle.dump(args, f)
 
                 if args.save_model:
                     utils.save_model(optim, 'outputs/%s/optim_%d.npy' % (args.exp_name, epoch))

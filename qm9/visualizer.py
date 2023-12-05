@@ -304,7 +304,7 @@ def plot_grid():
     plt.show()
 
 
-def visualize(path, dataset_info, max_num=25, wandb=None, spheres_3d=False):
+def visualize(path, dataset_info, epoch, max_num=25, wandb=None, spheres_3d=False):
     files = load_xyz_files(path)[0:max_num]
     for file in files:
         positions, one_hot, charges = load_molecule_xyz(file, dataset_info)
@@ -319,10 +319,10 @@ def visualize(path, dataset_info, max_num=25, wandb=None, spheres_3d=False):
             path = file[:-4] + '.png'
             # Log image(s)
             im = plt.imread(path)
-            wandb.log({'molecule': [wandb.Image(im, caption=path)]})
+            wandb.log({'molecule': [wandb.Image(im, caption=path)]}, step=epoch)
 
 
-def visualize_chain(path, dataset_info, wandb=None, spheres_3d=False,
+def visualize_chain(path, dataset_info, epoch, wandb=None, spheres_3d=False,
                     mode="chain"):
     files = load_xyz_files(path)
     files = sorted(files)
@@ -348,7 +348,7 @@ def visualize_chain(path, dataset_info, wandb=None, spheres_3d=False,
     imageio.mimsave(gif_path, imgs, subrectangles=True)
 
     if wandb is not None:
-        wandb.log({mode: [wandb.Video(gif_path, caption=gif_path)]})
+        wandb.log({mode: [wandb.Video(gif_path, caption=gif_path)]}, step=epoch)
 
 
 def visualize_chain_uncertainty(
