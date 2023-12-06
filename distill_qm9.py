@@ -1,4 +1,5 @@
 import argparse
+import copy
 import getpass
 import pickle
 import time
@@ -8,12 +9,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
+
 import wandb
 from configs.datasets_config import get_dataset_info
 from equivariant_diffusion.utils import (
     assert_mean_zero_with_mask,
     remove_mean_with_mask,
     sample_center_gravity_zero_gaussian_with_mask,
+    EMA
 )
 from qm9 import dataset, losses
 from qm9.models import get_latent_consistency, get_latent_diffusion, get_optim
@@ -67,7 +70,7 @@ def parse_args():
         action="store_true",
         help="Train first stage AutoEncoder model",
     )
-    training_args.add_argument("--lr", type=float, default=2e-4)
+    training_args.add_argument("--lr", type=float, default=2e-5)
     # training_args.add_argument(
     #     "--conditioning",
     #     nargs="+",
@@ -117,6 +120,7 @@ def preprocess_data(args, data, device, dtype):
 
 def train_epoch(
     args,
+    rank,
     loader,
     nodes_dist,
     epoch,
@@ -128,7 +132,13 @@ def train_epoch(
     device,
     dtype,
 ):
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+    # ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+    ema_model = None
+
+    # ema_model = copy.deepcopy(model)
+    # ema = EMA(ema_decay)
+
+    nll_epoch = []
     model.train()
     n_iterations = len(loader)
     for i, data in enumerate(loader):
@@ -144,17 +154,22 @@ def train_epoch(
             args, model, ema_model, teacher_model, nodes_dist, x, h, node_mask, edge_mask, context
         )
         loss = nll
+        nll_epoch.append(nll.item())
         loss.backward()
 
         optim.step()
 
         # Update EMA
-        ema_model.update_parameters(model)
+        # ema.update_model_average(ema_model, model)
 
-        if i % args.n_report_steps == 0:
+        if i % args.n_report_steps == 0 and rank==0:
             print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
-                  f"Loss {loss.item():.2f}, NLL: {nll.item():.2f}, "
+                  f"Loss {(loss.item() * 100):.2f}, NLL: {nll.item():.2f}, "
                   f"RegTerm: {reg_term.item():.1f}, ")
+    if rank==0:
+        print ("Train Epoch NLL", sum(nll_epoch)/len(nll_epoch))
+        wandb.log({"Train Epoch NLL": sum(nll_epoch)/len(nll_epoch)}, commit=False, step=epoch)
+
 
 def main(args):
     # Set up DDP -------------
@@ -219,7 +234,7 @@ def main(args):
         )
     )
     # student_model.load_teacher_model(teacher_model)
-    student_model = DDP(student_model, device_ids=[rank], find_unused_parameters=False)
+    student_model = DDP(student_model, device_ids=[rank], find_unused_parameters=True)
 
     # Create Optimizer -----------
     optim = get_optim(args, student_model)
@@ -231,18 +246,20 @@ def main(args):
         start_epoch = time.time()
         train_epoch(
             args=args,
+            rank=rank,
             loader=dataloaders["train"],
             nodes_dist=nodes_dist,
             epoch=epoch,
             model=student_model,
             teacher_model=teacher_model,
-            ema_decay=0.95,
+            ema_decay=1,
             optim=optim,
             gradnorm_queue=gradnorm_queue,
             device=device_id,
             dtype=dtype,
         )
-        print(f"Epoch {epoch} took {time.time() - start_epoch:.1f} seconds.")
+        if rank == 0:
+            print(f"Epoch {epoch} took {time.time() - start_epoch:.1f} seconds.")
 
 
 if __name__ == "__main__":
