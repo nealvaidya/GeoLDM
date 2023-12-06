@@ -44,15 +44,10 @@ def compute_loss_and_nll(args, generative_model, ema_model, teacher_model, nodes
         # 'categorical' and 'integer'.
         nll = generative_model(x, h, node_mask, edge_mask, ema_model, teacher_model, context)
 
-        N = node_mask.squeeze(2).sum(1).long()
-
-        log_pN = nodes_dist.log_prob(N)
-
-        assert nll.size() == log_pN.size()
-        nll = nll - log_pN
+        nll = nll
 
         # Average over batch.
-        nll = nll.mean(0)
+        # nll = nll.mean(0)
 
         reg_term = torch.tensor([0.]).to(nll.device)
         mean_abs_z = 0.
