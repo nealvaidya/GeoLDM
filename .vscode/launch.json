@@ -12,14 +12,17 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
+                "--nnodes=1",
+                "--nproc-per-node=1",
                 "distill_qm9.py",
                 "--teacher_model", "outputs/qm9_latent2",
                 "--no_wandb",
+                "--batch_size", "128"
                 // "--train_diffusion",
                 // "--latent_nf", "1"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0",
+                // "CUDA_VISIBLE_DEVICES": "0,1",
                 "TORCH_DISTRIBUTED_DEBUG": "INFO"
             }
         }

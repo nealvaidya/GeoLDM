@@ -34,6 +34,7 @@ class EnLatentConsistency(EnLatentDiffusion):
         # self.teacher_pred_noise = None
 
         self.skip_k = skip_k
+        self.trainable_ae = False
 
         # self.ema_model = None
         # self.ema_decay = ema_decay
@@ -59,19 +60,21 @@ class EnLatentConsistency(EnLatentDiffusion):
         scaled_timestep = timestep * self.timestep_scaling
 
         c_skip = self.sigma_data**2 / (scaled_timestep**2 + self.sigma_data**2)
-        c_out = (timestep / 0.1) / (scaled_timestep**2 + self.sigma_data**2) ** 0.5
+        c_out = scaled_timestep / (scaled_timestep**2 + self.sigma_data**2) ** 0.5
 
-        return c_skip.unsqueeze(-1), c_out.unsqueeze(-1)
+        return c_skip, c_out
 
-    def compute_loss(self, x, h, node_mask, edge_mask, context, ema_model, teacher_model, t0_always):
+    def compute_loss(
+        self, x, h, node_mask, edge_mask, context, ema_model, teacher_model, t0_always
+    ):
         # This part is about whether to include loss term 0 always.
-        if t0_always:
-            # loss_term_0 will be computed separately.
-            # estimator = loss_0 + loss_t,  where t ~ U({1, ..., T})
-            lowest_t = 1
-        else:
-            # estimator = loss_t,           where t ~ U({0, ..., T})
-            lowest_t = 0
+        # if t0_always:
+        #     # loss_term_0 will be computed separately.
+        #     # estimator = loss_0 + loss_t,  where t ~ U({1, ..., T})
+        #     lowest_t = 1
+        # else:
+        # estimator = loss_t,           where t ~ U({0, ..., T})
+        lowest_t = 0
 
         # Sample noise epsilon ~ Normal(0, I)
         eps = self.sample_combined_position_feature_noise(
@@ -119,17 +122,25 @@ class EnLatentConsistency(EnLatentDiffusion):
         z_0_pred_from_start = (z_t_start - eps_pred * sigma_t_start) / alpha_t_start
 
         # Implement skip connection for consistency boundary
-        # TODO: Should this be t or t_int?
         c_skip_start, c_out_start = self.scalings_for_boundary_conditions(t_start)
+        c_skip_start = self.inflate_batch_array(c_skip_start, z_t_start)
+        c_out_start = self.inflate_batch_array(c_out_start, z_0_pred_from_start)
         model_pred = (c_skip_start * z_t_start) + (c_out_start * z_0_pred_from_start)
 
         # TODO: Take k ODE Steps
         # i.e. denoise z_t_start k times to get z_hat_t_skip
         with torch.no_grad():
             z_hat_t_skip = teacher_model.module.sample_p_zs_given_zt(
-                t_skip, t_start, z_t_start, node_mask, edge_mask, context, fix_noise=False
+                t_skip,
+                t_start,
+                z_t_start,
+                node_mask,
+                edge_mask,
+                context,
+                fix_noise=False,
             )
-            # teacher_eps_pred = self.teacher_pred_noise(
+            # z_hat_t_skip = z_t_start
+            # teacher_eps_pred = teacher_model.module.phi(
             #     z_t_start, t_start, node_mask, edge_mask, context
             # )
 
@@ -137,15 +148,23 @@ class EnLatentConsistency(EnLatentDiffusion):
             #     (sigma_t_start * alpha_t_skip) / (alpha_t_skip * sigma_t_skip) - 1
             # ) * teacher_eps_pred
 
-        # Get target LCM prediction from xh_prev using the ema model
-        with torch.no_grad():
-            target_eps_pred = ema_model.module.module.phi(
+            # Get target LCM prediction from xh_prev using the ema model
+            # with torch.no_grad():
+            # target_eps_pred = ema_model.module.phi(
+            #     z_hat_t_skip, t_skip, node_mask, edge_mask, context
+            # )
+            target_eps_pred = self.phi(
                 z_hat_t_skip, t_skip, node_mask, edge_mask, context
             )
+
             z_0_pred_from_skip = (
                 z_hat_t_skip - target_eps_pred * sigma_t_skip
             ) / alpha_t_skip
+
             c_skip_skip, c_out_skip = self.scalings_for_boundary_conditions(t_skip)
+            c_skip_skip = self.inflate_batch_array(c_skip_skip, z_hat_t_skip)
+            c_out_skip = self.inflate_batch_array(c_out_skip, z_0_pred_from_skip)
+
             target_pred = (c_skip_skip * z_hat_t_skip) + (
                 c_out_skip * z_0_pred_from_skip
             )
@@ -206,17 +225,24 @@ class EnLatentConsistency(EnLatentDiffusion):
     #     z_h = {"categorical": torch.zeros(0).to(z_h), "integer": z_h}
 
     def forward(
-        self, x, h, node_mask=None, edge_mask=None, ema_model=None, teacher_model=None, context=None
+        self,
+        x,
+        h,
+        node_mask=None,
+        edge_mask=None,
+        ema_model=None,
+        teacher_model=None,
+        context=None,
     ):
         """
         Computes the loss (type l2 or NLL) if training. And if eval then always computes NLL.
         """
 
         # Encode data to latent space.
-        with torch.no_grad():
-            z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.vae.encode(
-                x, h, node_mask, edge_mask, context
-            )
+        # with torch.no_grad():
+        z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.vae.encode(
+            x, h, node_mask, edge_mask, context
+        )
         # Compute fixed sigma values.
         t_zeros = torch.zeros(size=(x.size(0), 1), device=x.device)
         gamma_0 = self.inflate_batch_array(self.gamma(t_zeros), x)
@@ -229,31 +255,27 @@ class EnLatentConsistency(EnLatentDiffusion):
         # z_xh_sigma = torch.cat([z_x_sigma.expand(-1, -1, 3), z_h_sigma], dim=2)
         z_xh = self.vae.sample_normal(z_xh_mean, z_xh_sigma, node_mask)
         # z_xh = z_xh_mean
-        # z_xh = z_xh.detach()  # Always keep the encoder fixed.
+        z_xh = z_xh.detach()  # Always keep the encoder fixed.
         diffusion_utils.assert_correctly_masked(z_xh, node_mask)
-
-        # Compute reconstruction loss.
-        if self.trainable_ae:
-            xh = torch.cat([x, h["categorical"], h["integer"]], dim=2)
-            # Decoder output (reconstruction).
-            x_recon, h_recon = self.vae.decoder._forward(
-                z_xh, node_mask, edge_mask, context
-            )
-            xh_rec = torch.cat([x_recon, h_recon], dim=2)
-            loss_recon = self.vae.compute_reconstruction_error(xh_rec, xh)
-        else:
-            loss_recon = 0
 
         z_x = z_xh[:, :, : self.n_dims]
         z_h = z_xh[:, :, self.n_dims :]
         diffusion_utils.assert_mean_zero_with_mask(z_x, node_mask)
+
         # Make the data structure compatible with the EnVariationalDiffusion compute_loss().
         z_h = {"categorical": torch.zeros(0).to(z_h), "integer": z_h}
 
         if self.training:
             # Only 1 forward pass when t0_always is False.
             loss_ld, loss_dict = self.compute_loss(
-                z_x, z_h, node_mask, edge_mask, context, ema_model, teacher_model, t0_always=False
+                z_x,
+                z_h,
+                node_mask,
+                edge_mask,
+                context,
+                ema_model,
+                teacher_model,
+                t0_always=False,
             )
         else:
             # Less variance in the estimator, costs two forward passes.
@@ -263,16 +285,17 @@ class EnLatentConsistency(EnLatentDiffusion):
 
         # The _constants_ depending on sigma_0 from the
         # cross entropy term E_q(z0 | x) [log p(x | z0)].
-        neg_log_constants = -self.log_constants_p_h_given_z0(
-            torch.cat([h["categorical"], h["integer"]], dim=2), node_mask
-        )
+        # neg_log_constants = -self.log_constants_p_h_given_z0(
+        #     torch.cat([h["categorical"], h["integer"]], dim=2), node_mask
+        # )
         # Reset constants during training with l2 loss.
-        if self.training and self.loss_type == "l2":
-            neg_log_constants = torch.zeros_like(neg_log_constants)
+        # if self.training and self.loss_type == "l2":
+        #     neg_log_constants = torch.zeros_like(neg_log_constants)
 
-        neg_log_pxh = loss_ld + loss_recon + neg_log_constants
+        # neg_log_pxh = loss_ld + loss_recon + neg_log_constants
 
-        return neg_log_pxh
+        # return neg_log_pxh
+        return loss_ld
 
     @torch.no_grad()
     def sample(
