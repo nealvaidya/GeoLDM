@@ -1,22 +1,31 @@
-import wandb
-from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
-    assert_correctly_masked, sample_center_gravity_zero_gaussian_with_mask
-import numpy as np
-import qm9.visualizer as vis
-from qm9.analyze import analyze_stability_for_molecules
-from qm9.sampling import sample_chain, sample, sample_sweep_conditional
-import utils
-import qm9.utils as qm9utils
-from qm9 import losses
 import time
+
+import numpy as np
+import qm9.utils as qm9utils
+import qm9.visualizer as vis
 import torch
+import torch.nn.functional as F
+import utils
+import wandb
 from equivariant_diffusion import utils as diffusion_utils
+from equivariant_diffusion.utils import (
+    assert_correctly_masked, assert_mean_zero_with_mask, remove_mean_with_mask,
+    sample_center_gravity_zero_gaussian_with_mask)
+from qm9 import losses
+from qm9.analyze import analyze_stability_for_molecules
+from qm9.sampling import sample, sample_chain, sample_sweep_conditional
 
 
-def train_epoch(args, loader, epoch, teacher, model, model_dp, model_ema, ema, device, dtype, property_norms, optim,
-                nodes_dist, gradnorm_queue, dataset_info, prop_dist):
+def train_epoch(args, loader, epoch, teacher, model, model_dp, model_ema, device, dtype, property_norms, optim,
+                scheduler, nodes_dist, gradnorm_queue, dataset_info, prop_dist):
     model_dp.train()
-    model.train() # NOTE 'model' is the student model (takes $args.diffusion_steps steps), 'teacher' is the teacher
+    model.train()
+
+    if args.dp and torch.cuda.device_count() > 1:
+        student_ema = model_ema.module.module.student
+    else:
+        student_ema = model_ema.module.student
+
     loss_epoch = []
     n_iterations = len(loader)
     for i, data in enumerate(loader):
@@ -51,76 +60,49 @@ def train_epoch(args, loader, epoch, teacher, model, model_dp, model_ema, ema, d
         optim.zero_grad()
 
         # Compute teacher target (no_gard so the teacher stays fixed)
-        with torch.no_grad():
 
-            # Send batch to latent space
-            z_x, z_h =  encode_to_latent_space(teacher, x, h, node_mask, edge_mask, context) 
+        lambda_t, teacher_target, model_pred = model(x, h, node_mask, edge_mask, context)
 
-            # Sample time steps
-            t, u, v, alpha_t, sigma_t, alpha_u, sigma_u, alpha_v, sigma_v = sample_time_steps(teacher, args.diffusion_steps, z_x)
+        truncated_snr = torch.maximum(lambda_t, torch.ones_like(lambda_t)).squeeze()
+        F.mse_loss(model_pred, teacher_target, reduction = "none").sum(-1).sum(-1)
 
-            # Sample zt ~ Normal(alpha_t x, sigma_t)
-            eps = teacher.sample_combined_position_feature_noise(n_samples=x.size(0), 
-                                                                 n_nodes=x.size(1), node_mask=node_mask)
-
-            # Concatenate x, h[integer] and h[categorical].
-            xh = torch.cat([z_x, z_h['categorical'], z_h['integer']], dim=2)
-
-            # Sample z_t given x, h for timestep t, from q(z_t | x, h)
-            z_t = alpha_t * xh + sigma_t * eps
-
-            diffusion_utils.assert_mean_zero_with_mask(z_t[:, :, :model.n_dims], node_mask)
-
-            # Compute double denoising steps
-            xhat_zt = denoise_step(teacher, z_t, alpha_t, sigma_t, t, node_mask, edge_mask, context)
-            z_u = alpha_u * xhat_zt + (sigma_u/sigma_t) * (z_t - alpha_t * xhat_zt)
-
-            xhat_zu = denoise_step(teacher, z_u, alpha_u, sigma_u, u, node_mask, edge_mask, context)
-            z_v = alpha_v * xhat_zu + (sigma_v/sigma_u) * (z_u - alpha_u * xhat_zu)
-
-            teacher_target = (z_v - (sigma_v/sigma_t)*z_t)/(alpha_v - (sigma_v/sigma_t)*alpha_t)
-
-        # Detach target and inputs for *extra* caution
-        teacher_target.detach()
-        z_t.detach()
-        alpha_t.detach()
-        sigma_t.detach()
-        t.detach()        
-
-        # Foward pass of the student
-        student_target = denoise_step(model, z_t, alpha_t, sigma_t, t, node_mask, edge_mask, context)
-        
         # Compute loss
-        loss = torch.square(student_target - teacher_target)
+        loss = truncated_snr * F.mse_loss(model_pred, teacher_target, reduction = "none").sum(-1).sum(-1)
         loss = loss.mean()
 
         # Take backward pass
         loss.backward()
 
         if args.clip_grad:
-            grad_norm = utils.gradient_clipping(model, gradnorm_queue)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=1, norm_type=2.0
+            )
         else:
             grad_norm = 0.
 
         # Optimize student params
         optim.step()
+        scheduler.step()
 
         # Update EMA if enabled.
         if args.ema_decay > 0:
-            ema.update_model_average(model_ema, model)
+            model_ema.update_parameters(model)
+
+        loss_epoch.append(loss.item())
 
         if i % args.n_report_steps == 0:
             print(f"\rEpoch: {epoch}, iter: {i}/{n_iterations}, "
-                  f"Loss {loss.item():.2f}"
-                  f"GradNorm: {grad_norm:.1f}")
-        loss_epoch.append(loss.item())
+                  f"Loss {loss.item():.2f}, "
+                  f"GradNorm: {grad_norm:.1f}, "
+                  f"Epoch Loss:  {sum(loss_epoch)/len(loss_epoch)}")
+
         if (epoch % args.test_epochs == 0) and (i % args.visualize_every_batch == 0) and not (epoch == 0 and i == 0) and args.train_diffusion:
             start = time.time()
             if len(args.conditioning) > 0:
-                save_and_sample_conditional(args, device, model_ema, prop_dist, dataset_info, epoch=epoch)
-            save_and_sample_chain(model_ema, args, device, dataset_info, prop_dist, epoch=epoch,
+                save_and_sample_conditional(args, device, student_ema, prop_dist, dataset_info, epoch=epoch)
+            save_and_sample_chain(student_ema, args, device, dataset_info, prop_dist, epoch=epoch,
                                   batch_id=str(i))
-            sample_different_sizes_and_save(model_ema, nodes_dist, args, device, dataset_info,
+            sample_different_sizes_and_save(student_ema, nodes_dist, args, device, dataset_info,
                                             prop_dist, epoch=epoch)
             print(f'Sampling took {time.time() - start:.2f} seconds')
 
@@ -189,10 +171,10 @@ def encode_to_latent_space(model, x, h, node_mask, edge_mask, context):
 
 
 def denoise_step(model, z_t, alpha_t, sigma_t, t, node_mask, edge_mask, context):
-        
+
     return z_t / alpha_t - model.phi(z_t, t, node_mask, edge_mask, context) * sigma_t / alpha_t
-        
-        
+
+
 
 def check_mask_correct(variables, node_mask):
     for i, variable in enumerate(variables):
