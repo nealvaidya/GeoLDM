@@ -31,3 +31,6 @@ qm9_conditional.sh
 figures/
 geom_drugs.sh
 notebooks/*
+*.sqsh
+*.sub
+*.out

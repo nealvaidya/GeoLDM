@@ -5,7 +5,7 @@ from qm9.data.utils import initialize_datasets
 import os
 
 
-def retrieve_dataloaders(cfg):
+def retrieve_dataloaders(cfg, device):
     if 'qm9' in cfg.dataset:
         batch_size = cfg.batch_size
         num_workers = cfg.num_workers
@@ -48,7 +48,7 @@ def retrieve_dataloaders(cfg):
                                                         filter_size=cfg.filter_molecule_size)
         transform = build_geom_dataset.GeomDrugsTransform(dataset_info,
                                                           cfg.include_charges,
-                                                          cfg.device,
+                                                          device,
                                                           cfg.sequential)
         dataloaders = {}
         for key, data_list in zip(['train', 'val', 'test'], split_data):

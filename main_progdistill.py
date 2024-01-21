@@ -135,6 +135,10 @@ parser.add_argument(
     help="When set to an integer value, QM9 will only contain molecules of that amount of atoms",
 )
 parser.add_argument(
+    "--filter_molecule_size", type=int, default=None,
+    help="Only use molecules below this size"
+)
+parser.add_argument(
     "--dequantization",
     type=str,
     default="argmax_variational",
@@ -207,13 +211,15 @@ parser.add_argument(
 parser.add_argument(
     "--aggregation_method", type=str, default="sum", help='"sum" or "mean"'
 )
+parser.add_argument('--sequential', action='store_true',
+                    help='Organize data by size to reduce average memory usage.')
 
 args = parser.parse_args()
 
 dataset_info = get_dataset_info(args.dataset, args.remove_h)
 
-atom_encoder = dataset_info["atom_encoder"]
-atom_decoder = dataset_info["atom_decoder"]
+# atom_encoder = dataset_info["atom_encoder"]
+# atom_decoder = dataset_info["atom_decoder"]
 
 # args, unparsed_args = parser.parse_known_args()
 args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
@@ -244,7 +250,7 @@ wandb.init(**kwargs)
 wandb.save("*.txt")
 
 # Retrieve QM9 dataloaders
-dataloaders, charge_scale = dataset.retrieve_dataloaders(args)
+dataloaders, charge_scale = dataset.retrieve_dataloaders(args, device=device)
 
 data_dummy = next(iter(dataloaders["train"]))
 

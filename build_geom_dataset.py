@@ -103,7 +103,10 @@ def load_split_data(conformation_file, val_proportion=0.1, test_proportion=0.1,
     num_mol = len(data_list)
     val_index = int(num_mol * val_proportion)
     test_index = val_index + int(num_mol * test_proportion)
-    val_data, test_data, train_data = np.split(data_list, [val_index, test_index])
+    # val_data, test_data, train_data = np.split(data_list, [val_index, test_index])
+    val_data = data_list[:val_index]
+    test_data = data_list[val_index:test_index]
+    train_data = data_list[test_index:]
     return train_data, val_data, test_data
 
 
@@ -238,7 +241,7 @@ if __name__ == '__main__':
     parser.add_argument("--conformations", type=int, default=30,
                         help="Max number of conformations kept for each molecule.")
     parser.add_argument("--remove_h", action='store_true', help="Remove hydrogens from the dataset.")
-    parser.add_argument("--data_dir", type=str, default='/data/geom/')
+    parser.add_argument("--data_dir", type=str, default='./data/geom/')
     parser.add_argument("--data_file", type=str, default="drugs_crude.msgpack")
     args = parser.parse_args()
     extract_conformers(args)
